@@ -98,6 +98,7 @@ func ExampleCommand_Run_appHelp() {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "name", Value: "bob", Usage: "a name to say"},
 		},
+		Arguments: cli.AnyArguments,
 		Commands: []*cli.Command{
 			{
 				Name:        "describeit",
@@ -181,13 +182,10 @@ func ExampleCommand_Run_commandHelp() {
 	//    greet describeit - use it to see a description
 	//
 	// USAGE:
-	//    greet describeit [command [command options]] [arguments...]
+	//    greet describeit [arguments...]
 	//
 	// DESCRIPTION:
 	//    This is how we describe describeit the function
-	//
-	// COMMANDS:
-	//    help, h  Shows a list of commands or help for one command
 	//
 	// OPTIONS:
 	//    --help, -h  show help
@@ -205,10 +203,7 @@ func ExampleCommand_Run_noAction() {
 	//    greet - A new cli application
 	//
 	// USAGE:
-	//    greet [global options] [command [command options]] [arguments...]
-	//
-	// COMMANDS:
-	//    help, h  Shows a list of commands or help for one command
+	//    greet [global options]
 	//
 	// GLOBAL OPTIONS:
 	//    --help, -h  show help
