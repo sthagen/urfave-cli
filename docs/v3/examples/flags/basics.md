@@ -134,6 +134,7 @@ Note that most flag can be invoked multiple times but only the last value entere
 will be provided to the user(with some exceptions. See flags-advanced.md)
 
 The following basic flags are supported
+
 - `IntFlag`
 - `Int8Flag`
 - `Int16Flag`
@@ -147,6 +148,8 @@ The following basic flags are supported
 - `BoolFlag`
 - `DurationFlag`
 - `FloatFlag`
+- `Float32Flag`
+- `Float64Flag`
 - `StringFlag`
 - `TimestampFlag`
 
