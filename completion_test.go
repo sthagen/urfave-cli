@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,6 +62,27 @@ func TestCompletionShell(t *testing.T) {
 			)
 		})
 	}
+}
+
+func TestCompletionBashNoShebang(t *testing.T) {
+	// Regression test for https://github.com/urfave/cli/issues/2259
+	// Bash completion scripts are sourced, not executed, so they must not
+	// start with a `#!` shebang (flagged by Debian lintian as
+	// `bash-completion-with-hashbang`).
+
+	cmd := &Command{
+		EnableShellCompletion: true,
+	}
+
+	r := require.New(t)
+
+	bashRender := shellCompletions["bash"]
+	r.NotNil(bashRender, "bash completion renderer should exist")
+
+	output, err := bashRender(cmd, "myapp")
+	r.NoError(err)
+	r.NotEmpty(output, "bash completion output should not be empty")
+	r.False(strings.HasPrefix(output, "#!"), "bash completion should not start with a shebang")
 }
 
 func TestCompletionFishFormat(t *testing.T) {
@@ -121,14 +143,13 @@ func TestCompletionSubcommand(t *testing.T) {
 			},
 		},
 		{
-			name:     "subcommand flag no completion",
+			name:     "subcommand double dash shows long flags",
 			args:     []string{"foo", "bar", "--", completionFlag},
-			contains: "l1",
-			msg:      "Expected output to contain shell name %[1]q",
+			contains: "--l1",
+			msg:      "Expected output to contain flag %[1]q",
 			msgArgs: []any{
-				"l1",
+				"--l1",
 			},
-			notContains: true,
 		},
 		{
 			name:     "sub sub command general completion",
@@ -150,14 +171,13 @@ func TestCompletionSubcommand(t *testing.T) {
 			},
 		},
 		{
-			name:     "sub sub command no completion",
+			name:     "sub sub command double dash shows flags",
 			args:     []string{"foo", "bar", "xyz", "--", completionFlag},
-			contains: "-g",
+			contains: "--help",
 			msg:      "Expected output to contain flag %[1]q",
 			msgArgs: []any{
-				"-g",
+				"--help",
 			},
-			notContains: true,
 		},
 		{
 			name:     "sub sub command no completion extra args",
@@ -168,6 +188,24 @@ func TestCompletionSubcommand(t *testing.T) {
 				"-g",
 			},
 			notContains: true,
+		},
+		{
+			name:     "subcommand partial double dash flag completion",
+			args:     []string{"foo", "bar", "--l", completionFlag},
+			contains: "--l1",
+			msg:      "Expected output to contain flag %[1]q",
+			msgArgs: []any{
+				"--l1",
+			},
+		},
+		{
+			name:     "sub sub command partial double dash flag completion",
+			args:     []string{"foo", "bar", "xyz", "--he", completionFlag},
+			contains: "--help",
+			msg:      "Expected output to contain flag %[1]q",
+			msgArgs: []any{
+				"--help",
+			},
 		},
 	}
 
