@@ -5683,6 +5683,53 @@ func TestEmptyPositionalArgs(t *testing.T) {
 	}
 }
 
+// Regression for #2234: an empty positional arg following a flag used to be
+// dropped along with every arg after it.
+func TestEmptyPositionalArgsAfterFlag(t *testing.T) {
+	testCases := []struct {
+		Name         string
+		Args         []string
+		ExpectedArgs []string
+		ExpectedFlag string
+	}{
+		{
+			Name:         "empty arg after equals-form flag",
+			Args:         []string{"app", "-f=something", "", "arg2", "arg3"},
+			ExpectedArgs: []string{"", "arg2", "arg3"},
+			ExpectedFlag: "something",
+		},
+		{
+			Name:         "empty arg after space-form flag",
+			Args:         []string{"app", "-f", "something", "", "arg2"},
+			ExpectedArgs: []string{"", "arg2"},
+			ExpectedFlag: "something",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			var args []string
+			var flagVal string
+
+			cmd := &Command{
+				Flags: []Flag{
+					&StringFlag{Name: "f"},
+				},
+				Action: func(_ context.Context, cmd *Command) error {
+					args = cmd.Args().Slice()
+					flagVal = cmd.String("f")
+					return nil
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), tc.Args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.ExpectedArgs, args)
+			assert.Equal(t, tc.ExpectedFlag, flagVal)
+		})
+	}
+}
+
 func TestFlagEqualsEmptyValue(t *testing.T) {
 	t.Run("--flag= sets empty string", func(t *testing.T) {
 		var val string
@@ -5723,4 +5770,34 @@ func TestFlagEqualsEmptyValue(t *testing.T) {
 		assert.Equal(t, "", val)
 		assert.Equal(t, []string{"positional"}, args)
 	})
+}
+
+// TestCommand_NoDefaultCmdArgMatchingFlag tests the argument set
+// of a command which has no default command, and has a flag with
+// the name of the next argument
+func TestCommand_NoDefaultCmdArgMatchingFlag(t *testing.T) {
+	expectedArgs := stringSliceArgs{v: []string{"flag"}}
+	var actualArgs Args
+	cmd := &Command{
+		Name: "rootCommand",
+		Flags: []Flag{
+			&StringFlag{
+				Name: "flag",
+			},
+		},
+		Commands: []*Command{
+			{
+				Name: "subCommand",
+			},
+		},
+		Action: func(ctx context.Context, c *Command) error {
+			actualArgs = c.Args()
+			return nil
+		},
+	}
+	// the last element - "flag" - is an argument sharing the same name as the flag
+	// "flag" of the rootCommand command
+	err := cmd.Run(buildTestContext(t), []string{"rootCommand", "--flag", "flagvalue", "flag"})
+	require.NoError(t, err)
+	require.Equal(t, &expectedArgs, actualArgs)
 }
