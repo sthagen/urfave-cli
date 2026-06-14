@@ -9,6 +9,8 @@ import (
 	"unicode"
 )
 
+type helpShownKey struct{}
+
 func (cmd *Command) parseArgsFromStdin() ([]string, error) {
 	type state int
 	const (
@@ -175,6 +177,15 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		deferErr = err
 
 		cmd.isInError = true
+		if cmd.checkHelp() {
+			ctx = context.WithValue(ctx, helpShownKey{}, true)
+			if cmd.parent == nil {
+				_ = ShowRootCommandHelp(cmd)
+			} else {
+				_ = ShowSubcommandHelp(cmd)
+			}
+			return ctx, nil
+		}
 		if cmd.OnUsageError != nil {
 			err = cmd.OnUsageError(ctx, cmd, err, cmd.parent != nil)
 			err = cmd.handleExitCoder(ctx, err)
@@ -193,10 +204,8 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 					tracef("SILENTLY IGNORING ERROR running ShowRootCommandHelp %[1]v (cmd=%[2]q)", err, cmd.Name)
 				}
 			} else {
-				tracef("running ShowCommandHelp with %[1]q", cmd.Name)
-				if err := ShowCommandHelp(ctx, cmd, cmd.Name); err != nil {
-					tracef("SILENTLY IGNORING ERROR running ShowCommandHelp with %[1]q %[2]v", cmd.Name, err)
-				}
+				tracef("running ShowSubcommandHelp for %[1]q", cmd.Name)
+				_ = ShowSubcommandHelp(cmd)
 			}
 		}
 
@@ -204,6 +213,7 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 	}
 
 	if cmd.checkHelp() {
+		ctx = context.WithValue(ctx, helpShownKey{}, true)
 		return ctx, helpCommandAction(ctx, cmd)
 	} else {
 		tracef("no help is wanted (cmd=%[1]q)", cmd.Name)
@@ -228,6 +238,9 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 
 	if cmd.After != nil && !cmd.Root().shellCompletion {
 		defer func() {
+			if ctx.Value(helpShownKey{}) != nil {
+				return
+			}
 			if err := cmd.After(ctx, cmd); err != nil {
 				err = cmd.handleExitCoder(ctx, err)
 
@@ -248,7 +261,14 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 				if cmd.OnUsageError != nil {
 					err = cmd.OnUsageError(ctx, cmd, err, cmd.parent != nil)
 				} else {
-					_ = ShowSubcommandHelp(cmd)
+					fmt.Fprintf(cmd.Root().ErrWriter, "Incorrect Usage: %s\n\n", err.Error())
+					if cmd.parent == nil {
+						_ = ShowRootCommandHelp(cmd)
+					} else {
+						if err := ShowCommandHelp(ctx, cmd.parent, cmd.Name); err != nil {
+							_ = ShowSubcommandHelp(cmd)
+						}
+					}
 				}
 				return ctx, err
 			}
@@ -328,7 +348,14 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		if cmd.OnUsageError != nil {
 			err = cmd.OnUsageError(ctx, cmd, err, cmd.parent != nil)
 		} else {
-			_ = ShowSubcommandHelp(cmd)
+			fmt.Fprintf(cmd.Root().ErrWriter, "Incorrect Usage: %s\n\n", err.Error())
+			if cmd.parent == nil {
+				_ = ShowRootCommandHelp(cmd)
+			} else {
+				if err := ShowCommandHelp(ctx, cmd.parent, cmd.Name); err != nil {
+					_ = ShowSubcommandHelp(cmd)
+				}
+			}
 		}
 		return ctx, err
 	}

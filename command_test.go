@@ -1810,6 +1810,50 @@ func TestCommand_AfterFunc(t *testing.T) {
 	assert.Equal(t, 0, counts.SubCommand, "Subcommand not executed when expected")
 }
 
+func TestCommand_AfterNotCalledOnSubcommandHelp(t *testing.T) {
+	var afterCalled bool
+	cmd := &Command{
+		After: func(_ context.Context, _ *Command) error {
+			afterCalled = true
+			return nil
+		},
+		Commands: []*Command{
+			{
+				Name: "sub",
+				Action: func(context.Context, *Command) error {
+					return nil
+				},
+			},
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"app", "sub", "--help"})
+	require.NoError(t, err)
+	assert.False(t, afterCalled, "After should not be called when --help is passed to subcommand")
+}
+
+func TestCommand_AfterStillCalledOnNormalSubcommand(t *testing.T) {
+	var afterCalled bool
+	cmd := &Command{
+		After: func(_ context.Context, _ *Command) error {
+			afterCalled = true
+			return nil
+		},
+		Commands: []*Command{
+			{
+				Name: "sub",
+				Action: func(context.Context, *Command) error {
+					return nil
+				},
+			},
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"app", "sub"})
+	require.NoError(t, err)
+	assert.True(t, afterCalled, "After should be called on normal subcommand execution")
+}
+
 func TestCommandNoHelpFlag(t *testing.T) {
 	oldFlag := HelpFlag
 	defer func() {
@@ -1964,6 +2008,183 @@ func TestRequiredFlagCommandRunBehavior(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCommand_IncorrectUsageOnRequiredFlagsViaRun(t *testing.T) {
+	t.Run("root command missing required flag", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Flags: []Flag{
+				&StringFlag{Name: "requiredFlag", Required: true},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "command")
+	})
+
+	t.Run("subcommand missing required flag", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Commands: []*Command{
+				{
+					Name: "sub",
+					Flags: []Flag{
+						&StringFlag{Name: "requiredFlag", Required: true},
+					},
+					Action: func(ctx context.Context, cmd *Command) error {
+						return nil
+					},
+				},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command", "sub"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "sub")
+	})
+}
+
+func TestCommand_IncorrectUsageOnMutuallyExclusiveFlagsViaRun(t *testing.T) {
+	t.Run("root command with mutex violation", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			MutuallyExclusiveFlags: []MutuallyExclusiveFlags{
+				{
+					Flags: [][]Flag{
+						{&StringFlag{Name: "foo1"}},
+						{&StringFlag{Name: "foo2"}},
+					},
+				},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command", "--foo1", "v1", "--foo2", "v2"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "command")
+	})
+
+	t.Run("subcommand with mutex violation", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+			Commands: []*Command{
+				{
+					Name: "sub",
+					MutuallyExclusiveFlags: []MutuallyExclusiveFlags{
+						{
+							Flags: [][]Flag{
+								{&StringFlag{Name: "foo1"}},
+								{&StringFlag{Name: "foo2"}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command", "sub", "--foo1", "v1", "--foo2", "v2"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "sub")
+	})
+}
+
+func TestCommand_IncorrectUsageOnSubcommandWithFailingShowCommandHelp(t *testing.T) {
+	t.Run("required flags fallback to ShowSubcommandHelp", func(t *testing.T) {
+		oldShowCommandHelp := ShowCommandHelp
+		defer func() { ShowCommandHelp = oldShowCommandHelp }()
+		ShowCommandHelp = func(_ context.Context, _ *Command, _ string) error {
+			return errors.New("forced error")
+		}
+
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Commands: []*Command{
+				{
+					Name: "sub",
+					Flags: []Flag{
+						&StringFlag{Name: "requiredFlag", Required: true},
+					},
+					Action: func(ctx context.Context, cmd *Command) error {
+						return nil
+					},
+				},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command", "sub"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "sub")
+	})
+
+	t.Run("mutex flags fallback to ShowSubcommandHelp", func(t *testing.T) {
+		oldShowCommandHelp := ShowCommandHelp
+		defer func() { ShowCommandHelp = oldShowCommandHelp }()
+		ShowCommandHelp = func(_ context.Context, _ *Command, _ string) error {
+			return errors.New("forced error")
+		}
+
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+			Commands: []*Command{
+				{
+					Name: "sub",
+					MutuallyExclusiveFlags: []MutuallyExclusiveFlags{
+						{
+							Flags: [][]Flag{
+								{&StringFlag{Name: "foo1"}},
+								{&StringFlag{Name: "foo2"}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_ = cmd.Run(buildTestContext(t), []string{"command", "sub", "--foo1", "v1", "--foo2", "v2"})
+		r.Contains(errBuf.String(), "Incorrect Usage")
+		r.Contains(buf.String(), "sub")
+	})
 }
 
 func TestCommandHelpPrinter(t *testing.T) {
@@ -2183,6 +2404,104 @@ func TestCommand_OrderOfOperations(t *testing.T) {
 		r.Equal(2, counts.Action)
 		r.Equal(3, counts.After)
 		r.Equal(3, counts.Total)
+	})
+}
+
+func TestCommand_HelpFlagTakesPrecedenceOverParseErrors(t *testing.T) {
+	t.Run("root command with --help and bad flag", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"command", "--help", "--undefined"})
+		r.NoError(err)
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "command")
+		r.NotContains(errBuf.String(), "Incorrect Usage")
+	})
+
+	t.Run("root command with -h and bad flag", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"command", "-h", "--undefined"})
+		r.NoError(err)
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "command")
+		r.NotContains(errBuf.String(), "Incorrect Usage")
+	})
+
+	t.Run("subcommand with --help and bad flag", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+			Commands: []*Command{
+				{
+					Name: "foo",
+					Action: func(ctx context.Context, cmd *Command) error {
+						return nil
+					},
+				},
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"command", "foo", "--help", "--undefined"})
+		r.NoError(err)
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "foo")
+		r.NotContains(errBuf.String(), "Incorrect Usage")
+	})
+
+	t.Run("subcommand with bad flag shows Incorrect Usage and help", func(t *testing.T) {
+		r := require.New(t)
+		var buf bytes.Buffer
+		var errBuf bytes.Buffer
+
+		cmd := &Command{
+			Writer:    &buf,
+			ErrWriter: &errBuf,
+			Action: func(ctx context.Context, cmd *Command) error {
+				return nil
+			},
+			Commands: []*Command{
+				{
+					Name: "foo",
+					Action: func(ctx context.Context, cmd *Command) error {
+						return nil
+					},
+				},
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"command", "foo", "--undefined"})
+		r.Error(err)
+		r.Contains(buf.String(), "NAME:")
+		r.Contains(buf.String(), "foo")
+		r.Contains(errBuf.String(), "Incorrect Usage")
 	})
 }
 
@@ -5894,4 +6213,87 @@ func TestCommand_NoDefaultCmdArgMatchingFlag(t *testing.T) {
 	err := cmd.Run(buildTestContext(t), []string{"rootCommand", "--flag", "flagvalue", "flag"})
 	require.NoError(t, err)
 	require.Equal(t, &expectedArgs, actualArgs)
+}
+
+func TestCommand_Path(t *testing.T) {
+	subCmd := &Command{Name: "bar"}
+	subSubCmd := &Command{Name: "baz"}
+	subCmd.Commands = []*Command{subSubCmd}
+
+	cmd := &Command{
+		Name:     "foo",
+		Commands: []*Command{subCmd},
+	}
+
+	require.NoError(t, cmd.Run(buildTestContext(t), []string{"foo", "bar", "baz"}))
+
+	assert.Equal(t, []string{"foo"}, cmd.Path())
+	assert.Equal(t, []string{"foo", "bar"}, subCmd.Path())
+	assert.Equal(t, []string{"foo", "bar", "baz"}, subSubCmd.Path())
+}
+
+func TestCommand_Walk(t *testing.T) {
+	subCmd := &Command{Name: "bar"}
+	subSubCmd := &Command{Name: "baz"}
+	subCmd.Commands = []*Command{subSubCmd}
+
+	cmd := &Command{
+		Name:     "foo",
+		Commands: []*Command{subCmd},
+	}
+
+	var visited []string
+	err := cmd.Walk(func(c *Command) error {
+		visited = append(visited, c.Name)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"foo", "bar", "baz"}, visited)
+}
+
+func TestCommand_Walk_ShortCircuit(t *testing.T) {
+	subCmd := &Command{Name: "bar"}
+	subSubCmd := &Command{Name: "baz"}
+	subCmd.Commands = []*Command{subSubCmd}
+
+	cmd := &Command{
+		Name:     "foo",
+		Commands: []*Command{subCmd},
+	}
+
+	errWalk := fmt.Errorf("stop")
+	var visited []string
+	err := cmd.Walk(func(c *Command) error {
+		visited = append(visited, c.Name)
+		if c.Name == "bar" {
+			return errWalk
+		}
+		return nil
+	})
+	assert.ErrorIs(t, err, errWalk)
+	assert.Equal(t, []string{"foo", "bar"}, visited)
+}
+
+func TestCommand_Walk_Hidden(t *testing.T) {
+	subCmd := &Command{Name: "bar", HideHelp: true}
+	subSubCmd := &Command{Name: "baz"}
+	subCmd.Commands = []*Command{subSubCmd}
+
+	cmd := &Command{
+		Name:     "foo",
+		Commands: []*Command{subCmd},
+	}
+
+	var visited []string
+	err := cmd.Walk(func(c *Command) error {
+		visited = append(visited, c.Name)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"foo", "bar", "baz"}, visited)
+}
+
+func TestCommand_Walk_NilFn(t *testing.T) {
+	cmd := &Command{Name: "foo"}
+	assert.Nil(t, cmd.Walk(nil))
 }
