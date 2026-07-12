@@ -3019,6 +3019,54 @@ func TestCustomFlagsUsed(t *testing.T) {
 	assert.NoError(t, err, "Run returned unexpected error")
 }
 
+// Regression for #2229. When a user flag claims the -v alias, only that
+// alias is yielded: --version must still print the version.
+func TestVersionFlagWorksWhenAliasYieldedToUserFlag(t *testing.T) {
+	buf := new(bytes.Buffer)
+	called := false
+
+	cmd := &Command{
+		Name:    "boom",
+		Version: "0.1.0",
+		Writer:  buf,
+		Flags: []Flag{
+			&BoolFlag{Name: "verbose", Aliases: []string{"v"}},
+		},
+		Action: func(_ context.Context, _ *Command) error {
+			called = true
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"boom", "--version"})
+
+	assert.NoError(t, err)
+	assert.False(t, called, "version should short-circuit the action")
+	assert.Contains(t, buf.String(), "0.1.0")
+}
+
+func TestDropClashingAliases(t *testing.T) {
+	verbose := &BoolFlag{Name: "verbose", Aliases: []string{"v"}}
+
+	for _, tc := range []struct {
+		name     string
+		aliases  []string
+		flags    []Flag
+		selfName string
+		want     []string
+	}{
+		{name: "no aliases", aliases: nil, flags: []Flag{verbose}, selfName: "version", want: nil},
+		{name: "no flags", aliases: []string{"v"}, flags: nil, selfName: "version", want: []string{"v"}},
+		{name: "drops clashing alias", aliases: []string{"v"}, flags: []Flag{verbose}, selfName: "version", want: []string{}},
+		{name: "keeps free alias", aliases: []string{"V"}, flags: []Flag{verbose}, selfName: "version", want: []string{"V"}},
+		{name: "keeps selfName even if claimed", aliases: []string{"verbose"}, flags: []Flag{verbose}, selfName: "verbose", want: []string{"verbose"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, dropClashingAliases(tc.aliases, tc.flags, tc.selfName))
+		})
+	}
+}
+
 func TestCustomHelpVersionFlags(t *testing.T) {
 	cmd := &Command{
 		Writer: io.Discard,
@@ -6213,6 +6261,111 @@ func TestCommand_NoDefaultCmdArgMatchingFlag(t *testing.T) {
 	err := cmd.Run(buildTestContext(t), []string{"rootCommand", "--flag", "flagvalue", "flag"})
 	require.NoError(t, err)
 	require.Equal(t, &expectedArgs, actualArgs)
+}
+
+func TestDefaultCommandWithSubcommandFlags(t *testing.T) {
+	// Regression test for https://github.com/urfave/cli/issues/2249
+	// When DefaultCommand is set, flags defined on the default subcommand
+	// should work even when the subcommand name is omitted.
+	actionExecuted := false
+	cmd := &Command{
+		DefaultCommand: "run1",
+		Commands: []*Command{
+			{
+				Name:  "run1",
+				Usage: "run the main application",
+				Action: func(ctx context.Context, cmd *Command) error {
+					actionExecuted = true
+					return nil
+				},
+				Flags: []Flag{
+					&StringFlag{
+						Name:     "foo",
+						Required: true,
+					},
+				},
+			},
+			{
+				Name: "run2",
+				Action: func(ctx context.Context, cmd *Command) error {
+					return nil
+				},
+				Flags: []Flag{
+					&StringFlag{
+						Name:     "value",
+						Required: true,
+					},
+				},
+			},
+		},
+	}
+
+	// Using flag without subcommand name should route to default command
+	err := cmd.Run(buildTestContext(t), []string{"c", "--foo", "bar"})
+	assert.NoError(t, err)
+	assert.True(t, actionExecuted, "expected run1 action to be executed")
+}
+
+func TestDefaultCommandWithShortFlag(t *testing.T) {
+	// Covers the short-flag splitting path in parseFlags when DefaultCommand is set
+	actionRun := false
+	cmd := &Command{
+		DefaultCommand: "run",
+		Commands: []*Command{
+			{
+				Name:  "run",
+				Usage: "run the app",
+				Action: func(ctx context.Context, cmd *Command) error {
+					actionRun = true
+					if cmd.String("foo") != "baz" {
+						return fmt.Errorf("expected foo=baz, got %s", cmd.String("foo"))
+					}
+					return nil
+				},
+				Flags: []Flag{
+					&StringFlag{
+						Name:    "foo",
+						Aliases: []string{"f"},
+					},
+				},
+			},
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"c", "-f", "baz"})
+	assert.NoError(t, err)
+	assert.True(t, actionRun, "expected run action to be executed")
+}
+
+func TestDefaultCommandWithShortFlagHandling(t *testing.T) {
+	// Covers the shortOptionHandling for-loop path when DefaultCommand is set
+	actionRun := false
+	cmd := &Command{
+		UseShortOptionHandling: true,
+		DefaultCommand:         "run",
+		Commands: []*Command{
+			{
+				Name:  "run",
+				Usage: "run the app",
+				Action: func(ctx context.Context, cmd *Command) error {
+					actionRun = true
+					if cmd.String("foo") != "baz" {
+						return fmt.Errorf("expected foo=baz, got %s", cmd.String("foo"))
+					}
+					return nil
+				},
+				Flags: []Flag{
+					&StringFlag{
+						Name:    "foo",
+						Aliases: []string{"f"},
+					},
+				},
+			},
+		},
+	}
+	err := cmd.Run(buildTestContext(t), []string{"c", "-f", "baz"})
+	assert.NoError(t, err)
+	assert.True(t, actionRun, "expected run action to be executed")
 }
 
 func TestCommand_Path(t *testing.T) {
