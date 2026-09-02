@@ -258,6 +258,13 @@ type AfterFunc func(context.Context, *Command) error
     AfterFunc is an action that executes after any subcommands are run and have
     finished. The AfterFunc is run even if Action() panics.
 
+type ArgValidatorFunc func(context.Context, *Command) error
+    ArgValidatorFunc is an action to validate arguments before the command
+    is run. If non-nil, it is called before the command's After and Action
+    functions. Returning a non-nil error short-circuits the command and
+    propagates as the exit error. If the current command does not set
+    ArgValidator, the nearest ancestor that does is used instead.
+
 type Args interface {
 	// Get returns the nth argument, or else a blank string
 	Get(n int) string
@@ -294,6 +301,7 @@ type ArgumentBase[T any, C any, VC ValueCreator[T, C]] struct {
 	Value       T      `json:"value"`     // the default value of this argument
 	Destination *T     `json:"-"`         // the destination point for this argument
 	UsageText   string `json:"usageText"` // the usage text to show
+	Required    bool   `json:"required"`  // whether the argument is required or not
 	Config      C      `json:"config"`    // config for this argument similar to Flag Config
 
 	// Has unexported fields.
@@ -464,6 +472,9 @@ type Command struct {
 	Flags []Flag `json:"flags"`
 	// Boolean to hide built-in help command and help flag
 	HideHelp bool `json:"hideHelp"`
+	// Boolean to hide the built-in help command. Applies to this command and
+	// all of its subcommands: as with HideHelp, a true value is inherited and
+	// a subcommand cannot turn it back off.
 	// Ignored if HideHelp is true.
 	HideHelpCommand bool `json:"hideHelpCommand"`
 	// Boolean to hide built-in version flag and the VERSION section of help
@@ -482,6 +493,11 @@ type Command struct {
 	// An action to execute after any subcommands are run, but after the subcommand has finished
 	// It is run even if Action() panics
 	After AfterFunc `json:"-"`
+	// An action to validate arguments before the command is run. If non-nil, it
+	// is called before Before and Action. If the current command does not set
+	// ArgValidator, the nearest ancestor that does is used instead.
+	// Returning a non-nil error short-circuits the command.
+	ArgValidator ArgValidatorFunc `json:"-"`
 	// The function to call when this command is invoked
 	Action ActionFunc `json:"-"`
 	// Execute this function if the proper command cannot be found
@@ -564,6 +580,9 @@ type Command struct {
 
 func (cmd *Command) Args() Args
     Args returns the command line arguments associated with the command.
+    If the command declares named Arguments, the arguments consumed by them
+    are not included in the returned Args and should be retrieved via the
+    command.{Type}Arg(name) functions instead.
 
 func (cmd *Command) Bool(name string) bool
 

@@ -6450,3 +6450,149 @@ func TestCommand_Walk_NilFn(t *testing.T) {
 	cmd := &Command{Name: "foo"}
 	assert.Nil(t, cmd.Walk(nil))
 }
+
+func TestCommand_ArgValidator_RunsBeforeAction(t *testing.T) {
+	var validated bool
+	var actionRan bool
+
+	cmd := &Command{
+		Name: "test",
+		ArgValidator: func(_ context.Context, _ *Command) error {
+			validated = true
+			return nil
+		},
+		Action: func(_ context.Context, _ *Command) error {
+			actionRan = true
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"test"})
+	require.NoError(t, err)
+	assert.True(t, validated)
+	assert.True(t, actionRan)
+}
+
+func TestCommand_ArgValidator_ErrorShortCircuitsAction(t *testing.T) {
+	var actionRan bool
+
+	cmd := &Command{
+		Name: "test",
+		ArgValidator: func(_ context.Context, _ *Command) error {
+			return fmt.Errorf("validation failed")
+		},
+		Action: func(_ context.Context, _ *Command) error {
+			actionRan = true
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"test"})
+	assert.ErrorContains(t, err, "validation failed")
+	assert.False(t, actionRan)
+}
+
+func TestCommand_ArgValidator_InheritsFromParent(t *testing.T) {
+	var validated bool
+
+	root := &Command{
+		Name: "root",
+		ArgValidator: func(_ context.Context, _ *Command) error {
+			validated = true
+			return nil
+		},
+		Commands: []*Command{
+			{
+				Name:   "sub",
+				Action: func(_ context.Context, _ *Command) error { return nil },
+			},
+		},
+	}
+
+	err := root.Run(buildTestContext(t), []string{"root", "sub"})
+	require.NoError(t, err)
+	assert.True(t, validated)
+}
+
+func TestCommand_ArgValidator_SubcommandOverride(t *testing.T) {
+	var parentValidated bool
+	var childValidated bool
+
+	root := &Command{
+		Name: "root",
+		ArgValidator: func(_ context.Context, _ *Command) error {
+			parentValidated = true
+			return nil
+		},
+		Commands: []*Command{
+			{
+				Name: "sub",
+				ArgValidator: func(_ context.Context, _ *Command) error {
+					childValidated = true
+					return nil
+				},
+				Action: func(_ context.Context, _ *Command) error { return nil },
+			},
+		},
+	}
+
+	err := root.Run(buildTestContext(t), []string{"root", "sub"})
+	require.NoError(t, err)
+	assert.False(t, parentValidated, "should use child's validator, not parent's")
+	assert.True(t, childValidated)
+}
+
+func TestCommand_ArgValidator_RunsBeforeBefore(t *testing.T) {
+	var order []string
+
+	cmd := &Command{
+		Name: "test",
+		ArgValidator: func(_ context.Context, _ *Command) error {
+			order = append(order, "validator")
+			return nil
+		},
+		Before: func(_ context.Context, _ *Command) (context.Context, error) {
+			order = append(order, "before")
+			return nil, nil
+		},
+		Action: func(_ context.Context, _ *Command) error {
+			order = append(order, "action")
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"test"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"validator", "before", "action"}, order)
+}
+
+// TestRunWithNoOsArgs checks that Run does not panic when handed an empty
+// argument slice. In particular, the combination of an empty Name and
+// EnableShellCompletion exercises both the setupDefaults empty-name guard
+// and the buildCompletionCommand("") append together.
+func TestRunWithNoOsArgs(t *testing.T) {
+	for _, tst := range []struct {
+		name     string
+		cmd      *Command
+		wantName string
+	}{
+		{name: "plain", cmd: &Command{Name: "foo"}, wantName: "foo"},
+		{name: "shell completion enabled", cmd: &Command{Name: "foo", EnableShellCompletion: true}, wantName: "foo"},
+		{name: "no name", cmd: &Command{}},
+		{name: "no name, shell completion enabled", cmd: &Command{EnableShellCompletion: true}},
+	} {
+		t.Run(tst.name, func(t *testing.T) {
+			called := false
+			tst.cmd.Action = func(context.Context, *Command) error {
+				called = true
+				return nil
+			}
+
+			require.NotPanics(t, func() {
+				require.NoError(t, tst.cmd.Run(buildTestContext(t), []string{}))
+			})
+			assert.True(t, called)
+			assert.Equal(t, tst.wantName, tst.cmd.Name)
+		})
+	}
+}
