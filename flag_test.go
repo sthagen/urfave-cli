@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -666,6 +667,129 @@ func TestStringFlagDefaultText(t *testing.T) {
 	fl := &StringFlag{Name: "foo", Aliases: nil, Usage: "amount of `foo` requested", Value: "none", DefaultText: "all of it"}
 	expected := "--foo foo\tamount of foo requested (default: all of it)"
 	assert.Equal(t, expected, fl.String())
+}
+
+// An empty value from a source can only be a value for a string, and reads as
+// false for a bool. For any other kind there is nothing to parse, so the source
+// must not count as setting the flag: that would satisfy Required with a zero
+// value, report IsSet for a flag that only holds its default, and hide a later
+// source in the chain that does carry a value.
+func TestFlagsFromEmptyEnv(t *testing.T) {
+	testCases := []struct {
+		name        string
+		env         map[string]string
+		fl          Flag
+		wantValue   any
+		wantIsSet   bool
+		errContains string
+	}{
+		{
+			name:        "required int from an empty env var is not set",
+			env:         map[string]string{"PORT": ""},
+			fl:          &IntFlag{Name: "port", Required: true, Sources: EnvVars("PORT")},
+			errContains: `Required flag "port" not set`,
+		},
+		{
+			name:        "required duration from an empty env var is not set",
+			env:         map[string]string{"TIMEOUT": ""},
+			fl:          &DurationFlag{Name: "timeout", Required: true, Sources: EnvVars("TIMEOUT")},
+			errContains: `Required flag "timeout" not set`,
+		},
+		{
+			name:      "int keeps its default and is not set",
+			env:       map[string]string{"PORT": ""},
+			fl:        &IntFlag{Name: "port", Value: 80, Sources: EnvVars("PORT")},
+			wantValue: 80,
+		},
+		{
+			name:      "string slice keeps its default and is not set",
+			env:       map[string]string{"TAGS": ""},
+			fl:        &StringSliceFlag{Name: "tags", Value: []string{"a"}, Sources: EnvVars("TAGS")},
+			wantValue: []string{"a"},
+		},
+		{
+			name:      "an empty env var does not hide a later one",
+			env:       map[string]string{"LEGACY_PORT": "", "PORT": "8080"},
+			fl:        &IntFlag{Name: "port", Value: 80, Sources: EnvVars("LEGACY_PORT", "PORT")},
+			wantValue: 8080,
+			wantIsSet: true,
+		},
+		{
+			name:        "an unparsable env var still fails before a later one",
+			env:         map[string]string{"LEGACY_PORT": "abc", "PORT": "8080"},
+			fl:          &IntFlag{Name: "port", Sources: EnvVars("LEGACY_PORT", "PORT")},
+			errContains: `could not parse "abc" as int value from environment variable "LEGACY_PORT"`,
+		},
+		{
+			name:      "an empty string is still a value",
+			env:       map[string]string{"NAME": ""},
+			fl:        &StringFlag{Name: "name", Value: "def", Sources: EnvVars("NAME")},
+			wantValue: "",
+			wantIsSet: true,
+		},
+		{
+			name:      "an empty bool still reads as false",
+			env:       map[string]string{"DEBUG": ""},
+			fl:        &BoolFlag{Name: "debug", Value: true, Sources: EnvVars("DEBUG")},
+			wantValue: false,
+			wantIsSet: true,
+		},
+		{
+			name: "an empty bool still runs the validator",
+			env:  map[string]string{"DEBUG": ""},
+			fl: &BoolFlag{Name: "debug", Value: true, Sources: EnvVars("DEBUG"), Validator: func(b bool) error {
+				if !b {
+					return errors.New("debug must be true")
+				}
+				return nil
+			}},
+			errContains: "debug must be true",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			name := tc.fl.Names()[0]
+			var gotValue any
+			var gotIsSet bool
+			cmd := &Command{
+				Flags: []Flag{tc.fl},
+				Action: func(_ context.Context, cmd *Command) error {
+					gotValue = cmd.Value(name)
+					gotIsSet = cmd.IsSet(name)
+					return nil
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), []string{"run"})
+			if tc.errContains != "" {
+				require.ErrorContains(t, err, tc.errContains)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantValue, gotValue)
+			assert.Equal(t, tc.wantIsSet, gotIsSet)
+		})
+	}
+}
+
+// The skip applies to every source in the chain, not only to environment
+// variables, so an empty file is treated the same way as an empty variable.
+func TestFlagFromEmptyFileSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "port")
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+
+	cmd := &Command{
+		Flags: []Flag{&IntFlag{Name: "port", Required: true, Sources: Files(path)}},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"run"})
+	require.ErrorContains(t, err, `Required flag "port" not set`)
 }
 
 func TestStringFlagWithEnvVarHelpOutput(t *testing.T) {
@@ -2718,6 +2842,55 @@ func TestTimestampFlagApply_ShortenedLayouts(t *testing.T) {
 	}
 }
 
+func TestTimestampFlagApply_TimeOnlyLayoutTimezoned(t *testing.T) {
+	for _, loc := range []*time.Location{
+		time.FixedZone("UTC-5", -5*60*60),
+		time.FixedZone("UTC+2", 2*60*60),
+	} {
+		for _, value := range []string{"01:00", "12:00", "20:00"} {
+			t.Run(loc.String()+" "+value, func(t *testing.T) {
+				var got time.Time
+				cmd := &Command{
+					Flags: []Flag{
+						&TimestampFlag{Name: "time", Config: TimestampConfig{Layouts: []string{"15:04"}, Timezone: loc}},
+					},
+					Action: func(_ context.Context, cmd *Command) error {
+						got = cmd.Timestamp("time")
+						return nil
+					},
+				}
+
+				assert.NoError(t, cmd.Run(buildTestContext(t), []string{"", "--time", value}))
+
+				clock, err := time.Parse("15:04", value)
+				assert.NoError(t, err)
+				now := time.Now().In(loc)
+				expected := time.Date(now.Year(), now.Month(), now.Day(), clock.Hour(), clock.Minute(), 0, 0, loc)
+				assert.Equal(t, expected, got)
+			})
+		}
+	}
+}
+
+func TestTimestampFlagApply_TimeOnlyLayoutWithOffset(t *testing.T) {
+	var got time.Time
+	cmd := &Command{
+		Flags: []Flag{
+			&TimestampFlag{Name: "time", Config: TimestampConfig{Layouts: []string{"15:04 -0700"}}},
+		},
+		Action: func(_ context.Context, cmd *Command) error {
+			got = cmd.Timestamp("time")
+			return nil
+		},
+	}
+
+	assert.NoError(t, cmd.Run(buildTestContext(t), []string{"", "--time", "20:00 -0500"}))
+
+	loc := time.FixedZone("", -5*60*60)
+	now := time.Now().In(loc)
+	assert.Equal(t, time.Date(now.Year(), now.Month(), now.Day(), 20, 0, 0, 0, loc), got)
+}
+
 func TestTimestampFlagApply_YearlessLayoutJanuaryFirst(t *testing.T) {
 	year := time.Now().UTC().Year()
 
@@ -2744,6 +2917,27 @@ func TestTimestampFlagApply_YearlessLayoutJanuaryFirst(t *testing.T) {
 
 			assert.NoError(t, cmd.Run(buildTestContext(t), []string{"", "--time", tc.value}))
 			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestTimestampFlagApply_ExplicitYearZero(t *testing.T) {
+	for _, tc := range []struct{ layout, value string }{
+		{time.RFC3339, "0000-02-29T12:34:56Z"},
+		{time.DateOnly, "0000-01-01"},
+		{"2006 15:04", "0000 12:34"},
+	} {
+		t.Run(tc.layout, func(t *testing.T) {
+			want, err := time.Parse(tc.layout, tc.value)
+			require.NoError(t, err)
+			cmd := &Command{
+				Flags: []Flag{&TimestampFlag{Name: "time", Config: TimestampConfig{Layouts: []string{tc.layout}}}},
+				Action: func(_ context.Context, cmd *Command) error {
+					assert.Equal(t, want, cmd.Timestamp("time"))
+					return nil
+				},
+			}
+			assert.NoError(t, cmd.Run(buildTestContext(t), []string{"app", "--time", tc.value}))
 		})
 	}
 }

@@ -79,6 +79,15 @@ func (cmd *Command) parseFlags(args Args) (Args, error) {
 	for rargs := args.Slice(); len(rargs) > 0; rargs = rargs[1:] {
 		tracef("rearrange:1 (cmd=%[1]q) %[2]q", cmd.Name, rargs)
 
+		// Check if we've reached the Nth argument and should stop flag parsing.
+		// This comes before the empty arg and "--" checks below, so that an
+		// empty arg or "--" after the Nth argument is passed through as is.
+		if cmd.StopOnNthArg != nil && len(posArgs) == *cmd.StopOnNthArg {
+			// Append current arg and all remaining args without parsing
+			posArgs = append(posArgs, rargs[0:]...)
+			return &stringSliceArgs{posArgs}, nil
+		}
+
 		firstArg := strings.TrimSpace(rargs[0])
 		if len(firstArg) == 0 {
 			posArgs = append(posArgs, rargs[0])
@@ -93,13 +102,6 @@ func (cmd *Command) parseFlags(args Args) (Args, error) {
 				posArgs = append(posArgs, firstArg)
 			}
 			posArgs = append(posArgs, rargs[1:]...)
-			return &stringSliceArgs{posArgs}, nil
-		}
-
-		// Check if we've reached the Nth argument and should stop flag parsing
-		if cmd.StopOnNthArg != nil && len(posArgs) == *cmd.StopOnNthArg {
-			// Append current arg and all remaining args without parsing
-			posArgs = append(posArgs, rargs[0:]...)
 			return &stringSliceArgs{posArgs}, nil
 		}
 
@@ -122,10 +124,9 @@ func (cmd *Command) parseFlags(args Args) (Args, error) {
 		}
 
 		numMinuses := 1
-		// this is same as firstArg == "-"
-		if len(firstArg) == 1 {
-			posArgs = append(posArgs, firstArg)
-			break
+		if firstArg == "-" {
+			posArgs = append(posArgs, rargs[0])
+			continue
 		}
 
 		shortOptionHandling := cmd.useShortOptionHandling()
@@ -213,29 +214,44 @@ func (cmd *Command) parseFlags(args Args) (Args, error) {
 			return &stringSliceArgs{posArgs}, fmt.Errorf("%s%s", providedButNotDefinedErrMsg, flagName)
 		}
 
-		// try to split the flags
+		// ranging over flagName yields byte offsets, so the last flag starts
+		// where its rune starts, which is not len-1 for a multi-byte rune
+		_, lastSize := utf8.DecodeLastRuneInString(flagName)
+		lastIndex := len(flagName) - lastSize
+
+		// every flag of the group has to exist before any of them is set,
+		// otherwise a group holding an unknown flag is reported by whichever
+		// of its flags happens to be examined first
 		for index, c := range flagName {
-			tracef("processing flag (fName=%[1]q)", string(c))
-			if sf := cmd.lookupFlag(string(c)); sf == nil {
+			if sf := cmd.lookupAppliedFlag(string(c)); sf == nil {
 				if index == 0 && cmd.DefaultCommand != "" {
 					posArgs = append(posArgs, rargs...)
 					return &stringSliceArgs{posArgs}, nil
 				}
 				return &stringSliceArgs{posArgs}, fmt.Errorf("%s%s", providedButNotDefinedErrMsg, flagName)
-			} else if fb, ok := sf.(boolFlag); ok && fb.IsBoolFlag() {
-				fv := flagVal
-				if index == (len(flagName)-1) && flagVal == "" {
-					fv = "true"
+			}
+		}
+
+		// try to split the flags
+		for index, c := range flagName {
+			tracef("processing flag (fName=%[1]q)", string(c))
+			// the check above has already found every flag of the group
+			sf := cmd.lookupAppliedFlag(string(c))
+			if fb, ok := sf.(boolFlag); ok && fb.IsBoolFlag() {
+				// the value after "=" belongs to the last flag of the group,
+				// so a bool flag before it is just set
+				fv := "true"
+				if index == lastIndex && flagVal != "" {
+					fv = flagVal
 				}
-				if fv == "" {
-					fv = "true"
-				}
-				if err := cmd.set(flagName, sf, fv); err != nil {
+				if err := cmd.set(string(c), sf, fv); err != nil {
 					tracef("processing flag.2 (fName=%[1]q)", string(c))
 					return &stringSliceArgs{posArgs}, err
 				}
-			} else if index == len(flagName)-1 { // last flag can take an arg
-				if flagVal == "" {
+			} else if index == lastIndex { // last flag can take an arg
+				// as with a single flag, an explicit "=" with nothing after
+				// it is an empty value, not a request to read the next arg
+				if flagVal == "" && !valFromEqual {
 					if len(rargs) == 1 {
 						return &stringSliceArgs{posArgs}, fmt.Errorf("%s%s", argumentNotProvidedErrMsg, string(c))
 					}
@@ -243,10 +259,15 @@ func (cmd *Command) parseFlags(args Args) (Args, error) {
 					rargs = rargs[1:]
 				}
 				tracef("parseFlags (flagName %[1]q) (flagVal %[2]q)", flagName, flagVal)
-				if err := cmd.set(flagName, sf, flagVal); err != nil {
+				if err := cmd.set(string(c), sf, flagVal); err != nil {
 					tracef("processing flag.4 (fName=%[1]q)", string(c))
 					return &stringSliceArgs{posArgs}, err
 				}
+			} else {
+				// only the last flag of a group can take an argument, so a flag
+				// that needs one has nothing to read it from here
+				tracef("processing flag.5 (fName=%[1]q)", string(c))
+				return &stringSliceArgs{posArgs}, fmt.Errorf("%s%s", argumentNotProvidedErrMsg, string(c))
 			}
 		}
 	}

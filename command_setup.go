@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -248,6 +249,12 @@ func (cmd *Command) ensureHelp() {
 	if !cmd.hideHelp() {
 		if cmd.Command(helpCommand.Name) == nil {
 			if !cmd.hideHelpCommand() {
+				// Drop any alias a user command already claims (e.g. h
+				// for history) so the user command wins and help does not
+				// list it, as for the help and version flags.
+				helpCommand.Aliases = slices.DeleteFunc(helpCommand.Aliases, func(alias string) bool {
+					return cmd.Command(alias) != nil
+				})
 				tracef("appending helpCommand (cmd=%[1]q)", cmd.Name)
 				cmd.appendCommand(helpCommand)
 			}
@@ -258,14 +265,21 @@ func (cmd *Command) ensureHelp() {
 				var localHelpFlag Flag
 				if globalHelpFlag, ok := HelpFlag.(*BoolFlag); ok {
 					flag := *globalHelpFlag
+					// Drop any alias a user flag already claims (e.g. -h
+					// for --host) so the user flag wins but --help still
+					// works, as for the version flag.
+					flag.Aliases = dropClashingAliases(flag.Aliases, cmd.allFlags(), flag.Name)
 					localHelpFlag = &flag
 				} else {
 					localHelpFlag = HelpFlag
 				}
 
-				tracef("appending HelpFlag (cmd=%[1]q)", cmd.Name)
-				cmd.appendFlag(localHelpFlag)
-				cmd.globaHelpFlagAdded = true
+				if !flagNamesInUse(cmd.allFlags(), localHelpFlag.Names()) {
+					tracef("appending HelpFlag (cmd=%[1]q)", cmd.Name)
+					cmd.appendFlag(localHelpFlag)
+					cmd.helpFlag = localHelpFlag
+					cmd.globaHelpFlagAdded = true
+				}
 			} else {
 				tracef("HelpFlag already added, skip (cmd=%[1]q)", cmd.Name)
 			}

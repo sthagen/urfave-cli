@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/mail"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,6 +224,11 @@ func TestParseAndRunShortOpts(t *testing.T) {
 		{testArgs: &stringSliceArgs{v: []string{"test", "-i", "ivalue"}}, expectedArgs: &stringSliceArgs{v: []string{}}},
 		{testArgs: &stringSliceArgs{v: []string{"test", "-i", "ivalue", "arg1"}}, expectedArgs: &stringSliceArgs{v: []string{"arg1"}}},
 		{testArgs: &stringSliceArgs{v: []string{"test", "-i"}}, expectedErr: "flag needs an argument: -i"},
+		// a flag that takes a value has to be the last one of a group
+		{testArgs: &stringSliceArgs{v: []string{"test", "-ia"}}, expectedErr: "flag needs an argument: i"},
+		{testArgs: &stringSliceArgs{v: []string{"test", "-ia", "ivalue"}}, expectedErr: "flag needs an argument: i"},
+		{testArgs: &stringSliceArgs{v: []string{"test", "-aic"}}, expectedErr: "flag needs an argument: i"},
+		{testArgs: &stringSliceArgs{v: []string{"test", "-ai", "ivalue"}}, expectedArgs: &stringSliceArgs{v: []string{}}},
 	}
 
 	for _, tc := range testCases {
@@ -1156,6 +1162,78 @@ func TestCommand_CommandWithDash(t *testing.T) {
 	require.Equal(t, "-", args.Get(1))
 }
 
+func TestCommand_BareDash(t *testing.T) {
+	cases := []struct {
+		name   string
+		argv   []string
+		option string
+		args   []string
+		err    string
+	}{
+		{
+			name: "arguments after a bare dash are kept",
+			argv: []string{"", "cmd", "-", "foo", "bar"},
+			args: []string{"-", "foo", "bar"},
+		},
+		{
+			name:   "flags after a bare dash still parse",
+			argv:   []string{"", "cmd", "-", "--option", "my-option", "foo"},
+			option: "my-option",
+			args:   []string{"-", "foo"},
+		},
+		{
+			name: "terminator after a bare dash still stops flag parsing",
+			argv: []string{"", "cmd", "-", "--", "--option", "leftover"},
+			args: []string{"-", "--option", "leftover"},
+		},
+		{
+			name: "a bare dash with surrounding whitespace is passed through unchanged",
+			argv: []string{"", "cmd", " - ", "foo"},
+			args: []string{" - ", "foo"},
+		},
+		{
+			name: "an undefined flag after a bare dash is an error",
+			argv: []string{"", "cmd", "-", "--undefined"},
+			err:  "flag provided but not defined: -undefined",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var parsedOption string
+			var args Args
+
+			cmd := &Command{
+				Writer:    io.Discard,
+				ErrWriter: io.Discard,
+				Commands: []*Command{
+					{
+						Name: "cmd",
+						Flags: []Flag{
+							&StringFlag{Name: "option", Value: "", Usage: "some option"},
+						},
+						Action: func(_ context.Context, cmd *Command) error {
+							parsedOption = cmd.String("option")
+							args = cmd.Args()
+							return nil
+						},
+					},
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), tc.argv)
+			if tc.err != "" {
+				require.EqualError(t, err, tc.err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.option, parsedOption)
+			require.NotNil(t, args)
+			require.Equal(t, tc.args, args.Slice())
+		})
+	}
+}
+
 func TestCommand_PositionalArgsKeepWhitespace(t *testing.T) {
 	var args Args
 
@@ -1390,6 +1468,27 @@ func TestCommand_UseShortOptionHandling(t *testing.T) {
 	assert.Equal(t, name, expected)
 }
 
+func TestCommand_UseShortOptionHandlingBoolWithInverse(t *testing.T) {
+	for _, args := range [][]string{{"-c", "-v"}, {"-cv"}, {"-vc"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := &Command{
+				Name:                   "app",
+				UseShortOptionHandling: true,
+				Flags: []Flag{
+					&BoolWithInverseFlag{Name: "color", Aliases: []string{"c"}},
+					&BoolFlag{Name: "verbose", Aliases: []string{"v"}},
+				},
+				Writer:    io.Discard,
+				ErrWriter: io.Discard,
+			}
+
+			require.NoError(t, cmd.Run(buildTestContext(t), append([]string{"app"}, args...)))
+			assert.True(t, cmd.Bool("color"))
+			assert.True(t, cmd.Bool("verbose"))
+		})
+	}
+}
+
 func TestCommand_UseShortOptionHandling_missing_value(t *testing.T) {
 	cmd := buildMinimalTestCommand()
 	cmd.UseShortOptionHandling = true
@@ -1399,6 +1498,75 @@ func TestCommand_UseShortOptionHandling_missing_value(t *testing.T) {
 
 	err := cmd.Run(buildTestContext(t), []string{"", "-n"})
 	assert.EqualError(t, err, "flag needs an argument: -n")
+}
+
+func TestCommand_UseShortOptionHandlingMultiByteLastFlag(t *testing.T) {
+	const name = "ש"
+
+	var verbose bool
+	var value string
+	var args []string
+	newCmd := func() *Command {
+		return &Command{
+			Name:                   "app",
+			UseShortOptionHandling: true,
+			Flags: []Flag{
+				&BoolFlag{Name: "v"},
+				&StringFlag{Name: name},
+			},
+			Action: func(_ context.Context, cmd *Command) error {
+				verbose = cmd.Bool("v")
+				value = cmd.String(name)
+				args = cmd.Args().Slice()
+				return nil
+			},
+			Writer:    io.Discard,
+			ErrWriter: io.Discard,
+		}
+	}
+
+	require.NoError(t, newCmd().Run(buildTestContext(t), []string{"app", "-v" + name, "value", "operand"}))
+	assert.True(t, verbose)
+	assert.Equal(t, "value", value)
+	assert.Equal(t, []string{"operand"}, args)
+
+	err := newCmd().Run(buildTestContext(t), []string{"app", "-v" + name})
+	assert.EqualError(t, err, "flag needs an argument: "+name)
+}
+
+func TestCommand_UseShortOptionHandlingValueForLastFlag(t *testing.T) {
+	var verbose, extra bool
+	var value string
+	var args []string
+	newCmd := func() *Command {
+		return &Command{
+			Name:                   "app",
+			UseShortOptionHandling: true,
+			Flags: []Flag{
+				&BoolFlag{Name: "v"},
+				&BoolFlag{Name: "x"},
+				&StringFlag{Name: "n"},
+			},
+			Action: func(_ context.Context, cmd *Command) error {
+				verbose = cmd.Bool("v")
+				extra = cmd.Bool("x")
+				value = cmd.String("n")
+				args = cmd.Args().Slice()
+				return nil
+			},
+			Writer:    io.Discard,
+			ErrWriter: io.Discard,
+		}
+	}
+
+	require.NoError(t, newCmd().Run(buildTestContext(t), []string{"app", "-vn=value", "operand"}))
+	assert.True(t, verbose)
+	assert.Equal(t, "value", value)
+	assert.Equal(t, []string{"operand"}, args)
+
+	require.NoError(t, newCmd().Run(buildTestContext(t), []string{"app", "-vx=false"}))
+	assert.True(t, verbose)
+	assert.False(t, extra)
 }
 
 func TestCommand_UseShortOptionHandlingCommand(t *testing.T) {
@@ -1502,6 +1670,56 @@ func TestCommand_UseShortOptionHandlingSubCommand_missing_value(t *testing.T) {
 
 	err := cmd.Run(buildTestContext(t), []string{"", "cmd", "sub", "-n"})
 	assert.EqualError(t, err, "flag needs an argument: -n")
+}
+
+func TestCommand_UseShortOptionHandlingLocalFlagNotInherited(t *testing.T) {
+	// A parent's Local flag is not applied to its subcommands, so it must be
+	// rejected inside a short option group too, as in long form (see
+	// TestLocalFlagError).
+	tests := []struct {
+		arg     string
+		wantErr string
+	}{
+		{arg: "-d", wantErr: "flag provided but not defined: -d"},
+		{arg: "-xd", wantErr: "flag provided but not defined: -xd"},
+		{arg: "-dx", wantErr: "flag provided but not defined: -dx"},
+		// reported before -s, which needs an argument but is not last
+		{arg: "-sd", wantErr: "flag provided but not defined: -sd"},
+		{arg: "-xy"}, // the subcommand's own flags still work
+	}
+	for _, tt := range tests {
+		t.Run(tt.arg, func(t *testing.T) {
+			var x, y bool
+			cmd := &Command{
+				Name:                   "app",
+				UseShortOptionHandling: true,
+				Flags: []Flag{
+					&BoolFlag{Name: "debug", Aliases: []string{"d"}, Local: true},
+				},
+				Commands: []*Command{
+					{
+						Name: "sub",
+						Flags: []Flag{
+							&BoolFlag{Name: "x", Destination: &x},
+							&BoolFlag{Name: "y", Destination: &y},
+							&StringFlag{Name: "s"},
+						},
+					},
+				},
+				Writer:    io.Discard,
+				ErrWriter: io.Discard,
+			}
+
+			err := cmd.Run(buildTestContext(t), []string{"app", "sub", tt.arg})
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, x)
+			assert.True(t, y)
+		})
+	}
 }
 
 func TestCommand_UseShortOptionAfterSliceFlag(t *testing.T) {
@@ -3944,6 +4162,105 @@ func TestDuplicatePersistentFlagUsesEnvSource(t *testing.T) {
 	require.True(t, app.Command("sub").IsSet("result"))
 }
 
+func TestPersistentFlagCommandLineOverridesSourceInSubcommand(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		flag  func() Flag
+		args  []string
+		value func(*Command) any
+		want  any
+	}{
+		{
+			name:  "string slice",
+			env:   "a,b",
+			flag:  func() Flag { return &StringSliceFlag{Name: "tags", Sources: EnvVars("APP_VALUE")} },
+			args:  []string{"--tags", "c"},
+			value: func(cmd *Command) any { return cmd.StringSlice("tags") },
+			want:  []string{"c"},
+		},
+		{
+			name:  "string map",
+			env:   "a=1",
+			flag:  func() Flag { return &StringMapFlag{Name: "labels", Sources: EnvVars("APP_VALUE")} },
+			args:  []string{"--labels", "b=2"},
+			value: func(cmd *Command) any { return cmd.StringMap("labels") },
+			want:  map[string]string{"b": "2"},
+		},
+		{
+			name:  "only once",
+			env:   "from-env",
+			flag:  func() Flag { return &StringFlag{Name: "name", Sources: EnvVars("APP_VALUE"), OnlyOnce: true} },
+			args:  []string{"--name", "from-cli"},
+			value: func(cmd *Command) any { return cmd.String("name") },
+			want:  "from-cli",
+		},
+		{
+			name:  "bool with inverse",
+			env:   "true",
+			flag:  func() Flag { return &BoolWithInverseFlag{Name: "color", Sources: EnvVars("APP_VALUE")} },
+			args:  []string{"--no-color"},
+			value: func(cmd *Command) any { return cmd.Bool("color") },
+			want:  false,
+		},
+	}
+
+	for _, test := range tests {
+		for _, where := range []string{"root", "sub"} {
+			t.Run(test.name+" on "+where, func(t *testing.T) {
+				t.Setenv("APP_VALUE", test.env)
+
+				var got any
+				cmd := &Command{
+					Name:  "root",
+					Flags: []Flag{test.flag()},
+					Commands: []*Command{
+						{
+							Name: "sub",
+							Action: func(_ context.Context, cmd *Command) error {
+								got = test.value(cmd)
+								return nil
+							},
+						},
+					},
+				}
+
+				args := append([]string{"root"}, test.args...)
+				args = append(args, "sub")
+				if where == "sub" {
+					args = append([]string{"root", "sub"}, test.args...)
+				}
+
+				require.NoError(t, cmd.Run(buildTestContext(t), args))
+				assert.Equal(t, test.want, got)
+			})
+		}
+	}
+}
+
+func TestPersistentFlagSourceResetKeepsSliceSeparator(t *testing.T) {
+	t.Setenv("APP_VALUE", "a;b")
+
+	var got []string
+	cmd := &Command{
+		Name:  "root",
+		Flags: []Flag{&StringSliceFlag{Name: "tags", Sources: EnvVars("APP_VALUE")}},
+		Commands: []*Command{
+			{
+				Name:               "sub",
+				SliceFlagSeparator: ";",
+				Action: func(_ context.Context, cmd *Command) error {
+					got = cmd.StringSlice("tags")
+					return nil
+				},
+			},
+		},
+	}
+
+	require.NoError(t, cmd.Run(buildTestContext(t), []string{"root", "sub", "--tags", "c;d"}))
+	assert.Equal(t, []string{"c", "d"}, got)
+}
+
 func TestRequiredFlagDelayed(t *testing.T) {
 	sf := &StringFlag{
 		Name:     "result",
@@ -4105,6 +4422,326 @@ func TestFlagDuplicates(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestDuplicateFlagNamesAreRejected(t *testing.T) {
+	tests := []struct {
+		name                   string
+		flags                  []Flag
+		mutuallyExclusiveFlags []MutuallyExclusiveFlags
+	}{
+		{
+			name: "duplicate flag names",
+			flags: []Flag{
+				&BoolFlag{Name: "config"},
+				&StringFlag{Name: "config"},
+			},
+		},
+		{
+			name: "duplicate flag aliases",
+			flags: []Flag{
+				&BoolFlag{Name: "verbose", Aliases: []string{"v"}},
+				&StringFlag{Name: "value", Aliases: []string{"v"}},
+			},
+		},
+		{
+			name: "flag and mutually exclusive flag",
+			flags: []Flag{
+				&StringFlag{Name: "config"},
+			},
+			mutuallyExclusiveFlags: []MutuallyExclusiveFlags{{
+				Flags: [][]Flag{
+					{&BoolFlag{Name: "config"}},
+					{&BoolFlag{Name: "other"}},
+				},
+			}},
+		},
+		{
+			name: "mutually exclusive flags",
+			mutuallyExclusiveFlags: []MutuallyExclusiveFlags{{
+				Flags: [][]Flag{
+					{&BoolFlag{Name: "config"}},
+					{&StringFlag{Name: "config"}},
+				},
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cmd := &Command{
+				Flags:                  test.flags,
+				MutuallyExclusiveFlags: test.mutuallyExclusiveFlags,
+				Action: func(context.Context, *Command) error {
+					return nil
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), []string{"foo"})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "defined multiple times")
+		})
+	}
+}
+
+// Duplicates in a subcommand are reported on any run, not only when that
+// subcommand runs.
+func TestDuplicateFlagNamesInSubcommandAreRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "root", args: []string{"foo"}},
+		{name: "root help flag", args: []string{"foo", "--help"}},
+		{name: "subcommand", args: []string{"foo", "sub"}},
+		{name: "subcommand help flag", args: []string{"foo", "sub", "--help"}},
+		{name: "help command", args: []string{"foo", "help", "sub"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cmd := &Command{
+				Writer: io.Discard,
+				Commands: []*Command{
+					{
+						Name: "sub",
+						Flags: []Flag{
+							&BoolFlag{Name: "help"},
+							&BoolFlag{Name: "help"},
+						},
+					},
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), test.args)
+			require.EqualError(t, err, `flag "help" defined multiple times in command "foo sub"`)
+		})
+	}
+}
+
+// A Go flag that another package registers on flag.CommandLine, such as
+// glog's -v, can't be renamed by the user, so it is not reported as a
+// duplicate. The user flag wins, as before.
+func TestDuplicateFlagNamesSkipExtFlags(t *testing.T) {
+	origCommandLine := flag.CommandLine
+	t.Cleanup(func() { flag.CommandLine = origCommandLine })
+	flag.CommandLine = flag.NewFlagSet("foo", flag.ContinueOnError)
+	ext := flag.Bool("v", false, "ext package flag usage")
+
+	cmd := &Command{
+		AllowExtFlags: true,
+		Flags: []Flag{
+			&BoolFlag{Name: "verbose", Aliases: []string{"v"}},
+		},
+		Action: func(context.Context, *Command) error {
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"foo", "-v"})
+	require.NoError(t, err)
+	require.True(t, cmd.Bool("verbose"))
+	require.False(t, *ext)
+}
+
+func TestUserDefinedHelpFlagOverridesBuiltin(t *testing.T) {
+	writer := &bytes.Buffer{}
+	cmd := &Command{
+		Writer: writer,
+		Flags: []Flag{
+			&BoolFlag{Name: "help", Usage: "custom help behavior"},
+		},
+		Action: func(context.Context, *Command) error {
+			return nil
+		},
+	}
+
+	err := cmd.Run(buildTestContext(t), []string{"foo", "--help"})
+	require.NoError(t, err)
+	require.True(t, cmd.Bool("help"))
+
+	var helpFlags int
+	for _, fl := range cmd.Flags {
+		if slices.Contains(fl.Names(), "help") {
+			helpFlags++
+		}
+	}
+	require.Equal(t, 1, helpFlags)
+	require.Contains(t, writer.String(), "--help  custom help behavior")
+	require.NotContains(t, writer.String(), "--help, -h  show help")
+}
+
+// When a user flag claims the -h alias, only that alias is yielded: -h
+// goes to the user flag and --help must still show help.
+func TestHelpFlagWorksWhenAliasYieldedToUserFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		flag       Flag
+		args       []string
+		wantCalled bool
+		wantValue  any
+	}{
+		{
+			name:      "long help",
+			flag:      &StringFlag{Name: "h", Usage: "host"},
+			args:      []string{"foo", "--help"},
+			wantValue: "",
+		},
+		{
+			name:       "user short flag",
+			flag:       &StringFlag{Name: "h", Usage: "host"},
+			args:       []string{"foo", "-h", "example.com"},
+			wantCalled: true,
+			wantValue:  "example.com",
+		},
+		{
+			name:       "user short bool flag",
+			flag:       &BoolFlag{Name: "h", Usage: "human readable"},
+			args:       []string{"foo", "-h"},
+			wantCalled: true,
+			wantValue:  true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &bytes.Buffer{}
+			called := false
+
+			cmd := &Command{
+				Writer: writer,
+				Flags:  []Flag{test.flag},
+				Action: func(context.Context, *Command) error {
+					called = true
+					return nil
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), test.args)
+			require.NoError(t, err)
+			require.Equal(t, test.wantCalled, called)
+			require.Equal(t, test.wantValue, cmd.Value("h"))
+			if !test.wantCalled {
+				require.Contains(t, writer.String(), "show help")
+				require.NotContains(t, writer.String(), "--help, -h")
+			}
+		})
+	}
+}
+
+// When a user command claims the h alias, only that alias is yielded: h runs
+// the user command, help still shows help, and the help listing no longer
+// advertises h for the help command.
+func TestHelpCommandYieldsAliasToUserCommand(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantHistory bool
+	}{
+		{name: "user alias", args: []string{"app", "h"}, wantHistory: true},
+		{name: "help command", args: []string{"app", "help"}},
+		{name: "help flag", args: []string{"app", "--help"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			ranHistory := false
+
+			cmd := &Command{
+				Name:   "app",
+				Writer: out,
+				Commands: []*Command{
+					{
+						Name:    "history",
+						Aliases: []string{"h"},
+						Usage:   "show history",
+						Action: func(context.Context, *Command) error {
+							ranHistory = true
+							return nil
+						},
+					},
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), test.args)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantHistory, ranHistory)
+			if !test.wantHistory {
+				assert.Contains(t, out.String(), "history, h")
+				assert.Regexp(t, `(?m)^\s+help\s+Shows a list of commands`, out.String())
+				assert.NotContains(t, out.String(), "help, h")
+			}
+		})
+	}
+}
+
+// A user flag that takes the name of the help flag, such as HelpFlag
+// itself listed in Flags, still shows help instead of running the action.
+func TestHelpFlagNameTakenByUserFlag(t *testing.T) {
+	origHelpFlag := HelpFlag
+	t.Cleanup(func() { HelpFlag = origHelpFlag })
+	helpFlag := *origHelpFlag.(*BoolFlag)
+	HelpFlag = &helpFlag
+
+	tests := []struct {
+		name     string
+		hideHelp bool
+		flag     Flag
+		args     []string
+	}{
+		{
+			name: "HelpFlag listed",
+			flag: HelpFlag,
+			args: []string{"foo", "--help"},
+		},
+		{
+			name: "HelpFlag listed in subcommand",
+			flag: HelpFlag,
+			args: []string{"foo", "sub", "--help"},
+		},
+		{
+			name: "HelpFlag listed in subcommand, short",
+			flag: HelpFlag,
+			args: []string{"foo", "sub", "-h"},
+		},
+		{
+			name:     "HideHelp and user help flag",
+			hideHelp: true,
+			flag:     &BoolFlag{Name: "help"},
+			args:     []string{"foo", "--help"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &bytes.Buffer{}
+			called := false
+			action := func(context.Context, *Command) error {
+				called = true
+				return nil
+			}
+
+			cmd := &Command{
+				Writer:   writer,
+				HideHelp: test.hideHelp,
+				Flags:    []Flag{test.flag},
+				Action:   action,
+				Commands: []*Command{
+					{
+						Name:   "sub",
+						Flags:  []Flag{test.flag},
+						Action: action,
+					},
+				},
+			}
+
+			err := cmd.Run(buildTestContext(t), test.args)
+			require.NoError(t, err)
+			require.False(t, called, "help should short-circuit the action")
+			require.Contains(t, writer.String(), "USAGE:")
 		})
 	}
 }
@@ -4597,6 +5234,26 @@ func TestCommand_Set(t *testing.T) {
 	r.NoError(cmd.Set("int", "1"))
 	r.Equal(int64(1), cmd.Int64("int"))
 	r.True(cmd.IsSet("int"))
+}
+
+func TestCommand_Set_ReplacesSourceValue(t *testing.T) {
+	t.Setenv("APP_VALUE", "a,b")
+
+	var got []string
+	cmd := &Command{
+		Name:  "root",
+		Flags: []Flag{&StringSliceFlag{Name: "tags", Sources: EnvVars("APP_VALUE")}},
+		Before: func(ctx context.Context, cmd *Command) (context.Context, error) {
+			return ctx, cmd.Set("tags", "c")
+		},
+		Action: func(_ context.Context, cmd *Command) error {
+			got = cmd.StringSlice("tags")
+			return nil
+		},
+	}
+
+	require.NoError(t, cmd.Run(buildTestContext(t), []string{"root"}))
+	assert.Equal(t, []string{"c"}, got)
 }
 
 func TestCommand_Set_InvalidFlagAccessHandler(t *testing.T) {
@@ -6372,6 +7029,48 @@ func TestFlagEqualsEmptyValue(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "", val)
 		assert.Equal(t, []string{"positional"}, args)
+	})
+
+	t.Run("-vn= in a short option group sets empty string", func(t *testing.T) {
+		var val string
+		var verbose bool
+		var args []string
+
+		cmd := &Command{
+			UseShortOptionHandling: true,
+			Flags: []Flag{
+				&BoolFlag{Name: "v", Destination: &verbose},
+				&StringFlag{Name: "n", Destination: &val, Value: "default"},
+			},
+			Action: func(_ context.Context, cmd *Command) error {
+				args = cmd.Args().Slice()
+				return nil
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"app", "-vn=", "positional"})
+		assert.NoError(t, err)
+		assert.True(t, verbose)
+		assert.Equal(t, "", val)
+		assert.Equal(t, []string{"positional"}, args)
+	})
+
+	t.Run("-vn= at the end of a short option group sets empty string", func(t *testing.T) {
+		var val string
+		var verbose bool
+
+		cmd := &Command{
+			UseShortOptionHandling: true,
+			Flags: []Flag{
+				&BoolFlag{Name: "v", Destination: &verbose},
+				&StringFlag{Name: "n", Destination: &val, Value: "default"},
+			},
+		}
+
+		err := cmd.Run(buildTestContext(t), []string{"app", "-vn="})
+		assert.NoError(t, err)
+		assert.True(t, verbose)
+		assert.Equal(t, "", val)
 	})
 }
 

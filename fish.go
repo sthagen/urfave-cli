@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"text/template"
+	"unicode/utf8"
 )
 
 // ToFishCompletion creates a fish completion string for the `*Command`
@@ -25,12 +25,6 @@ type fishCommandCompletionTemplate struct {
 }
 
 func (cmd *Command) writeFishCompletionTemplate(w io.Writer) error {
-	const name = "cli"
-	t, err := template.New(name).Parse(FishCompletionTemplate)
-	if err != nil {
-		return err
-	}
-
 	// Add global flags
 	completions := prepareFishFlags(cmd.Name, cmd)
 
@@ -57,7 +51,7 @@ func (cmd *Command) writeFishCompletionTemplate(w io.Writer) error {
 		toplevelCommandNames = append(toplevelCommandNames, child.Names()...)
 	}
 
-	return t.ExecuteTemplate(w, name, &fishCommandCompletionTemplate{
+	return renderFishCompletion(w, &fishCommandCompletionTemplate{
 		Command:     cmd,
 		Completions: completions,
 		AllCommands: toplevelCommandNames,
@@ -132,15 +126,15 @@ func prepareFishFlags(binary string, owner *Command) []string {
 
 		fishAddFileFlag(f, completion)
 
-		for idx, opt := range f.Names() {
-			if idx == 0 {
-				fmt.Fprintf(completion,
-					" -l %s", strings.TrimSpace(opt),
-				)
+		for _, opt := range f.Names() {
+			opt = strings.TrimSpace(opt)
+			// fish's -s takes a single character and a longer string is read as
+			// a group of one-character options, so only a one-character name
+			// is a short option. Any other name is a long option.
+			if utf8.RuneCountInString(opt) == 1 {
+				fmt.Fprintf(completion, " -s %s", opt)
 			} else {
-				fmt.Fprintf(completion,
-					" -s %s", strings.TrimSpace(opt),
-				)
+				fmt.Fprintf(completion, " -l %s", opt)
 			}
 		}
 
